@@ -14,7 +14,7 @@
 #define C1 (0.01f * 0.01f)
 #define C2 (0.03f * 0.03f)
 
-#define MAX_PATCH_SIZE 128
+#define MAX_PATCH_SIZE 100
 
 // Структура для хранения результатов
 struct MatchResult {
@@ -25,112 +25,99 @@ struct MatchResult {
 
 __constant__ float const_patch[MAX_PATCH_SIZE * MAX_PATCH_SIZE];
 
-
-// Ядро с использованием shared памяти
+// Ядро для вычисления SSIM между участком и окном
 __global__ void computeSSIMKernel(const float* map, 
                                  float* correlation, int map_width, int map_height,
                                  int patch_width, int patch_height, 
                                  int step_x, int step_y) {
+    // Разделяемая память для статистик
+    __shared__ float map_val[MAX_PATCH_SIZE][MAX_PATCH_SIZE];
+    __shared__ float map_cov[MAX_PATCH_SIZE][MAX_PATCH_SIZE];
+    __shared__ float map_patch[MAX_PATCH_SIZE][MAX_PATCH_SIZE];
+
     // Координаты в корреляционной матрице
     int grid_x = blockIdx.x;
     int grid_y = blockIdx.y;
-    
+
     // Координаты верхнего левого угла окна на карте
     int map_x = grid_x * step_x;
     int map_y = grid_y * step_y;
-    
-    // Проверка выхода за границы карты
-    if (map_x + patch_width > map_width || map_y + patch_height > map_height) {
-        return;
+
+    // Координаты верхнего левого угла окна на участке
+    int patch_x = threadIdx.x * blockDim.x;
+    int patch_y = threadIdx.y * blockDim.y;
+
+    // Потоки заполняют shared memory
+    for (int y = patch_y; y < patch_y + blockDim.y && y < patch_height; y += blockDim.y) {
+        for (int x = patch_x; x < patch_x + blockDim.x && x < patch_width; x += blockDim.x) {
+            int global_x = patch_x + x;
+            int global_y = patch_y + y;
+            
+            float val = 0.0f;
+            if (global_x < map_width && global_y < map_height) {
+                val = map[global_y * map_width + global_x];
+            }
+
+            map_val[y][x] = val;
+            map_cov[y][x] = val * val;
+            map_patch[y][x] = val * const_patch[y * patch_width + x];
+        }
     }
 
-    // Выделение shared memory для участка карты
-    extern __shared__ float shared_map[];
-    int shared_size = patch_width * patch_height;
-    
-    // Совместная загрузка данных в shared memory
-    for (int idx = threadIdx.y * blockDim.x + threadIdx.x; 
-         idx < shared_size; 
-         idx += blockDim.x * blockDim.y) {
-        int y = idx / patch_width;
-        int x = idx % patch_width;
-        shared_map[y * patch_width + x] = map[(map_y + y) * map_width + (map_x + x)];
-    }
     __syncthreads();
 
-    const int window_size = 8;
+    
+    const int window_size = 8; // Размер локального окна для SSIM
     float total_ssim = 0.0f;
     int window_count = 0;
-    
-    // Обработка локальных окон
-    for (int idx = threadIdx.y * blockDim.x + threadIdx.x; 
-         idx < (patch_height - window_size + 1) * (patch_width - window_size + 1); 
-         idx += blockDim.x * blockDim.y) {
-        
-        int wy = idx / (patch_width - window_size + 1);
-        int wx = idx % (patch_width - window_size + 1);
-        
-        float sum_map = 0.0f, sum_patch = 0.0f;
-        float sum_map_sq = 0.0f, sum_patch_sq = 0.0f;
-        float sum_map_patch = 0.0f;
-        
-        for (int y = 0; y < window_size; y++) {
-            for (int x = 0; x < window_size; x++) {
-                float map_val = shared_map[(wy + y) * patch_width + (wx + x)];
-                float patch_val = const_patch[(wy + y) * patch_width + (wx + x)];
-                
-                sum_map += map_val;
-                sum_patch += patch_val;
-                sum_map_sq += map_val * map_val;
-                sum_patch_sq += patch_val * patch_val;
-                sum_map_patch += map_val * patch_val;
+
+    // Проход по всем локальным окнам в пределах участка
+    for (int wy = patch_y; wy < patch_y + blockDim.y && wy <= patch_height - window_size; wy++) {
+        for (int wx = 0; wx < patch_x + blockDim.x && wx <= patch_width - window_size; wx++) {
+            float sum_map = 0.0f, sum_patch = 0.0f;
+            float sum_map_sq = 0.0f, sum_patch_sq = 0.0f;
+            float sum_map_patch = 0.0f;
+            
+            // Вычисление статистик ТОЛЬКО в пределах локального окна
+            for (int y = 0; y < window_size; y++) {
+                for (int x = 0; x < window_size; x++) {
+                    float patch_val = const_patch[(wy + y) * patch_width + (wx + x)];
+                    
+                    sum_map += map_val[y][x];
+                    sum_patch += patch_val;
+                    sum_map_sq += map_cov[y][x];
+                    sum_patch_sq += patch_val * patch_val;
+                    sum_map_patch += map_patch[y][x];
+                }
+            }
+            
+            // Вычисление SSIM для этого окна
+            float mean_map = sum_map / (window_size * window_size);
+            float mean_patch = sum_patch / (window_size * window_size);
+            float var_map = (sum_map_sq - mean_map * sum_map) / (window_size * window_size);
+            float var_patch = (sum_patch_sq - mean_patch * sum_patch) / (window_size * window_size);
+            float covar = (sum_map_patch - mean_map * sum_patch) / (window_size * window_size);
+            
+            float numerator = (2 * mean_map * mean_patch + C1) * (2 * covar + C2);
+            float denominator = (mean_map*mean_map + mean_patch*mean_patch + C1) * 
+                               (var_map + var_patch + C2);
+            
+            if (denominator != 0) {
+                total_ssim += numerator / denominator;
+                window_count++;
             }
         }
-        
-        // Вычисление SSIM
-        float n = window_size * window_size;
-        float mean_map = sum_map / n;
-        float mean_patch = sum_patch / n;
-        float var_map = (sum_map_sq - mean_map * sum_map) / n;
-        float var_patch = (sum_patch_sq - mean_patch * sum_patch) / n;
-        float covar = (sum_map_patch - mean_map * sum_patch) / n;
-        
-        float numerator = (2 * mean_map * mean_patch + C1) * (2 * covar + C2);
-        float denominator = (mean_map*mean_map + mean_patch*mean_patch + C1) * 
-                           (var_map + var_patch + C2);
-        
-        if (denominator != 0) {
-            total_ssim += numerator / denominator;
-            window_count++;
-        }
     }
     
-    // Редукция внутри блока
-    __shared__ float s_ssim[256];
-    __shared__ int s_count[256];
-    
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    s_ssim[tid] = total_ssim;
-    s_count[tid] = window_count;
+    int grid_idx = grid_y * ((map_width - patch_width) / step_x + 1) + grid_x;
+    correlation[grid_idx] = 0;
+
     __syncthreads();
-    
-    // Параллельная редукция
-    for (int s = blockDim.x * blockDim.y / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_ssim[tid] += s_ssim[tid + s];
-            s_count[tid] += s_count[tid + s];
-        }
-        __syncthreads();
-    }
-    
-    // Запись результата
-    if (tid == 0) {
-        float avg_ssim = s_count[0] > 0 ? s_ssim[0] / s_count[0] : 0.0f;
-        correlation[grid_y * gridDim.x + grid_x] = avg_ssim;
-    }
+
+    correlation[grid_idx] += window_count > 0 ? total_ssim / window_count : 0.0f;
 }
 
-// Остальной код без изменений
+// Функция для поиска участка на карте с помощью SSIM
 MatchResult findPatchOnMap(const float* h_map, const float* h_patch, 
                           int map_width, int map_height,
                           int patch_width, int patch_height,
@@ -139,11 +126,15 @@ MatchResult findPatchOnMap(const float* h_map, const float* h_patch,
     cudaMemcpyToSymbol(const_patch, h_patch, patch_size);
 
     // Выделение памяти на устройстве
-    float *d_map, *d_correlation;
+    float *d_map, *d_patch, *d_correlation;
     size_t map_size = map_width * map_height * sizeof(float);
     
     cudaMalloc(&d_map, map_size);
+    cudaMalloc(&d_patch, patch_size);
+    
+    // Копирование данных на устройство
     cudaMemcpy(d_map, h_map, map_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_patch, h_patch, patch_size, cudaMemcpyHostToDevice);
     
     // Размеры корреляционной матрицы
     int grid_width = (map_width - patch_width) / step_x + 1;
@@ -156,11 +147,8 @@ MatchResult findPatchOnMap(const float* h_map, const float* h_patch,
     dim3 blockSize(16, 16);
     dim3 gridSize(grid_width, grid_height);
     
-    // Вычисление shared memory
-    size_t shared_mem_size = patch_width * patch_height * sizeof(float);
-    
-    // Вызов ядра с shared memory
-    computeSSIMKernel<<<gridSize, blockSize, shared_mem_size>>>(d_map, d_correlation,
+    // Вычисление корреляционной матрицы
+    computeSSIMKernel<<<gridSize, blockSize>>>(d_map, d_correlation,
                                              map_width, map_height,
                                              patch_width, patch_height,
                                              step_x, step_y);
@@ -185,6 +173,7 @@ MatchResult findPatchOnMap(const float* h_map, const float* h_patch,
     // Освобождение памяти
     free(h_correlation);
     cudaFree(d_map);
+    cudaFree(d_patch);
     cudaFree(d_correlation);
     
     return best_match;
